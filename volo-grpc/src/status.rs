@@ -734,6 +734,18 @@ impl From<http::header::ToStrError> for Status {
     }
 }
 
+impl From<http::header::InvalidHeaderName> for Status {
+    fn from(err: http::header::InvalidHeaderName) -> Self {
+        Self::invalid_argument(err.to_string())
+    }
+}
+
+impl From<http::header::InvalidHeaderValue> for Status {
+    fn from(err: http::header::InvalidHeaderValue) -> Self {
+        Self::invalid_argument(err.to_string())
+    }
+}
+
 impl From<crate::metadata::errors::InvalidMetadataKey> for Status {
     fn from(err: crate::metadata::errors::InvalidMetadataKey) -> Self {
         Self::invalid_argument(err.to_string())

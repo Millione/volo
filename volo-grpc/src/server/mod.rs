@@ -2,6 +2,7 @@
 //!
 //! This module contains the low level component to build a gRPC server.
 
+mod convert;
 mod meta;
 mod router;
 mod service;
@@ -18,7 +19,10 @@ use volo::{net::incoming::Incoming, spawn};
 
 pub use self::router::Router;
 use crate::{
-    body::Body, context::ServerContext, server::meta::MetaService, Request, Response, Status,
+    body::Body,
+    context::ServerContext,
+    server::{convert::ConvertService, meta::MetaService},
+    Request, Response, Status,
 };
 
 /// A trait to provide a static reference to the service's
@@ -32,30 +36,32 @@ pub trait NamedService {
 
 /// A server for a gRPC service.
 #[derive(Clone)]
-pub struct Server<L> {
-    layer: L,
+pub struct Server<IL, OL> {
+    inner_layer: IL,
+    outer_layer: OL,
     http2_config: Http2Config,
     router: Router,
 }
 
-impl Default for Server<Identity> {
+impl Default for Server<Identity, Identity> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Server<Identity> {
+impl Server<Identity, Identity> {
     /// Creates a new [`Server`].
     pub fn new() -> Self {
         Self {
-            layer: Identity::new(),
+            inner_layer: Identity::new(),
+            outer_layer: Identity::new(),
             http2_config: Http2Config::default(),
             router: Router::new(),
         }
     }
 }
 
-impl<L> Server<L> {
+impl<IL, OL> Server<IL, OL> {
     /// Sets the [`SETTINGS_INITIAL_WINDOW_SIZE`] option for HTTP2
     /// stream-level flow control.
     ///
@@ -168,16 +174,20 @@ impl<L> Server<L> {
     ///
     /// The current order is: foo -> bar (the request will come to foo first, and then bar).
     ///
-    /// After we call `.layer(baz)`, we will get: foo -> bar -> baz.
-    pub fn layer<O>(self, layer: O) -> Server<Stack<O, L>> {
+    /// After we call `.layer_inner(baz)`, we will get: foo -> bar -> baz.
+    ///
+    /// The overall order for layers is: transport -> MetaService -> [outer] -> ConvertService ->
+    /// inner.
+    pub fn layer_inner<Inner>(self, layer: Inner) -> Server<Stack<Inner, IL>, OL> {
         Server {
-            layer: Stack::new(layer, self.layer),
+            inner_layer: Stack::new(layer, self.inner_layer),
+            outer_layer: self.outer_layer,
             http2_config: self.http2_config,
             router: self.router,
         }
     }
 
-    /// Adds a new front layer to the server.
+    /// Adds a new inner front layer to the server.
     ///
     /// The layer's `Service` should be `Send + Sync + Clone + 'static`.
     ///
@@ -187,10 +197,37 @@ impl<L> Server<L> {
     ///
     /// The current order is: foo -> bar (the request will come to foo first, and then bar).
     ///
-    /// After we call `.layer_front(baz)`, we will get: baz -> foo -> bar.
-    pub fn layer_front<Front>(self, layer: Front) -> Server<Stack<L, Front>> {
+    /// After we call `.layer_inner_front(baz)`, we will get: baz -> foo -> bar.
+    ///
+    /// The overall order for layers is: transport -> MetaService -> outer -> ConvertService ->
+    /// [inner].
+    pub fn layer_inner_front<Inner>(self, layer: Inner) -> Server<Stack<IL, Inner>, OL> {
         Server {
-            layer: Stack::new(self.layer, layer),
+            inner_layer: Stack::new(self.inner_layer, layer),
+            outer_layer: self.outer_layer,
+            http2_config: self.http2_config,
+            router: self.router,
+        }
+    }
+
+    /// Adds a new outer layer to the server.
+    ///
+    /// The layer's `Service` should be `Send + Sync + Clone + 'static`.
+    ///
+    /// # Order
+    ///
+    /// Assume we already have two layers: foo and bar. We want to add a new layer baz.
+    ///
+    /// The current order is: foo -> bar (the request will come to foo first, and then bar).
+    ///
+    /// After we call `.layer_outer(baz)`, we will get: foo -> bar -> baz.
+    ///
+    /// The overall order for layers is: transport -> MetaService -> [outer] -> ConvertService ->
+    /// inner.
+    pub fn layer_outer<Outer>(self, layer: Outer) -> Server<IL, Stack<Outer, OL>> {
+        Server {
+            inner_layer: self.inner_layer,
+            outer_layer: Stack::new(layer, self.outer_layer),
             http2_config: self.http2_config,
             router: self.router,
         }
@@ -207,7 +244,8 @@ impl<L> Server<L> {
             + 'static,
     {
         Self {
-            layer: self.layer,
+            inner_layer: self.inner_layer,
+            outer_layer: self.outer_layer,
             http2_config: self.http2_config,
             router: self.router.add_service(s),
         }
@@ -224,20 +262,28 @@ impl<L> Server<L> {
         signal: F,
     ) -> Result<(), BoxError>
     where
-        L: Layer<Router>,
-        L::Service: Service<ServerContext, Request<hyper::Body>, Response = Response<Body>>
+        IL: Layer<Router>,
+        IL::Service: Service<ServerContext, Request<hyper::Body>, Response = Response<Body>>
             + Clone
             + Send
             + Sync
             + 'static,
-        <L::Service as Service<ServerContext, Request<hyper::Body>>>::Error: Into<Status> + Send,
+        <IL::Service as Service<ServerContext, Request<hyper::Body>>>::Error: Into<Status> + Send,
+        OL: Layer<ConvertService<IL::Service>>,
+        OL::Service: Service<ServerContext, hyper::Request<hyper::Body>, Response = hyper::Response<Body>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <OL::Service as Service<ServerContext, hyper::Request<hyper::Body>>>::Error:
+            Into<Status> + Send + Sync + std::error::Error,
     {
         let mut incoming = incoming.make_incoming().await?;
         tracing::info!("[VOLO] server start at: {:?}", incoming);
 
-        let service = motore::builder::ServiceBuilder::new()
-            .layer(self.layer)
-            .service(self.router);
+        let service = self
+            .outer_layer
+            .layer(ConvertService::new(self.inner_layer.layer(self.router)));
 
         tokio::pin!(signal);
         let (tx, rx) = tokio::sync::watch::channel(());
@@ -259,7 +305,6 @@ impl<L> Server<L> {
                     };
                     tracing::trace!("[VOLO] recv a connection from: {:?}", conn.info.peer_addr);
                     let peer_addr = conn.info.peer_addr.clone();
-
                     let service = MetaService::new(service.clone(), peer_addr)
                         .tower(|req| (ServerContext::default(), req));
 
@@ -306,20 +351,28 @@ impl<L> Server<L> {
     /// The main entry point for the server.
     pub async fn run<A: volo::net::MakeIncoming>(self, incoming: A) -> Result<(), BoxError>
     where
-        L: Layer<Router>,
-        L::Service: Service<ServerContext, Request<hyper::Body>, Response = Response<Body>>
+        IL: Layer<Router>,
+        IL::Service: Service<ServerContext, Request<hyper::Body>, Response = Response<Body>>
             + Clone
             + Send
             + Sync
             + 'static,
-        <L::Service as Service<ServerContext, Request<hyper::Body>>>::Error: Into<Status> + Send,
+        <IL::Service as Service<ServerContext, Request<hyper::Body>>>::Error: Into<Status> + Send,
+        OL: Layer<ConvertService<IL::Service>>,
+        OL::Service: Service<ServerContext, hyper::Request<hyper::Body>, Response = hyper::Response<Body>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <OL::Service as Service<ServerContext, hyper::Request<hyper::Body>>>::Error:
+            Into<Status> + Send + Sync + std::error::Error,
     {
         self.run_with_shutdown(incoming, tokio::signal::ctrl_c())
             .await
     }
 }
 
-impl<L> fmt::Debug for Server<L> {
+impl<IL, OL> fmt::Debug for Server<IL, OL> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Server")
             .field("http2_config", &self.http2_config)

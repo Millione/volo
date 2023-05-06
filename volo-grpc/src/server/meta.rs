@@ -2,6 +2,7 @@ use std::{cell::RefCell, net::SocketAddr, str::FromStr, sync::Arc};
 
 use faststr::FastStr;
 use futures::Future;
+use http::{HeaderName, HeaderValue};
 use metainfo::{Backward, Forward};
 use volo::{
     context::{Context, Endpoint},
@@ -12,10 +13,8 @@ use volo::{
 use crate::{
     body::Body,
     context::ServerContext,
-    metadata::{
-        KeyAndValueRef, MetadataKey, DESTINATION_SERVICE, HEADER_TRANS_REMOTE_ADDR, SOURCE_SERVICE,
-    },
-    Request, Response, Status,
+    metadata::{DESTINATION_SERVICE, HEADER_TRANS_REMOTE_ADDR, SOURCE_SERVICE},
+    Status,
 };
 
 macro_rules! status_to_http {
@@ -41,7 +40,7 @@ impl<S> MetaService<S> {
 
 impl<S> Service<ServerContext, hyper::Request<hyper::Body>> for MetaService<S>
 where
-    S: Service<ServerContext, Request<hyper::Body>, Response = Response<Body>>
+    S: Service<ServerContext, hyper::Request<hyper::Body>, Response = hyper::Response<Body>>
         + Clone
         + Send
         + Sync
@@ -57,7 +56,7 @@ where
     fn call<'cx, 's>(
         &'s self,
         cx: &'cx mut ServerContext,
-        req: hyper::Request<hyper::Body>,
+        mut req: hyper::Request<hyper::Body>,
     ) -> Self::Future<'cx>
     where
         's: 'cx,
@@ -67,9 +66,9 @@ where
         metainfo::METAINFO.scope(RefCell::new(metainfo::MetaInfo::default()), async move {
             cx.rpc_info.method = Some(FastStr::new(req.uri().path()));
 
-            let mut volo_req = Request::from_http(req);
+            // let mut volo_req = Request::from_http(req);
 
-            let metadata = volo_req.metadata_mut();
+            let metadata = req.headers_mut();
 
             status_to_http!(metainfo::METAINFO.with(|metainfo| {
                 let mut metainfo = metainfo.borrow_mut();
@@ -99,26 +98,18 @@ where
 
                 // persistent and transient
                 let mut vec = Vec::with_capacity(metadata.len());
-                for key_and_value in metadata.iter() {
-                    match key_and_value {
-                        KeyAndValueRef::Ascii(k, v) => {
-                            let k = k.as_str();
-                            let v = v.to_str()?;
-                            if k.starts_with(metainfo::HTTP_PREFIX_PERSISTENT) {
-                                vec.push(k.to_owned());
-                                metainfo.strip_http_prefix_and_set_persistent(
-                                    k.to_owned(),
-                                    v.to_owned(),
-                                );
-                            } else if k.starts_with(metainfo::HTTP_PREFIX_TRANSIENT) {
-                                vec.push(k.to_owned());
-                                metainfo
-                                    .strip_http_prefix_and_set_upstream(k.to_owned(), v.to_owned());
-                            }
-                        }
-                        _ => unreachable!(),
+                for (k, v) in metadata.iter() {
+                    let k = k.as_str();
+                    let v = v.to_str()?;
+                    if k.starts_with(metainfo::HTTP_PREFIX_PERSISTENT) {
+                        vec.push(k.to_owned());
+                        metainfo.strip_http_prefix_and_set_persistent(k.to_owned(), v.to_owned());
+                    } else if k.starts_with(metainfo::HTTP_PREFIX_TRANSIENT) {
+                        vec.push(k.to_owned());
+                        metainfo.strip_http_prefix_and_set_upstream(k.to_owned(), v.to_owned());
                     }
                 }
+
                 for k in vec {
                     metadata.remove(k);
                 }
@@ -126,14 +117,14 @@ where
                 Ok::<(), Status>(())
             }));
 
-            let volo_resp = match self.inner.call(cx, volo_req).await {
+            let mut resp = match self.inner.call(cx, req).await {
                 Ok(resp) => resp,
                 Err(err) => {
                     return Ok(err.into().to_http());
                 }
             };
 
-            let (mut metadata, extensions, message) = volo_resp.into_parts();
+            let metadata = resp.headers_mut();
 
             status_to_http!(metainfo::METAINFO.with(|metainfo| {
                 let metainfo = metainfo.borrow_mut();
@@ -142,20 +133,20 @@ where
                 if let Some(at) = metainfo.get_all_backward_transients() {
                     for (key, value) in at {
                         let key = metainfo::HTTP_PREFIX_BACKWARD.to_owned() + key;
-                        metadata.insert(MetadataKey::from_str(key.as_str())?, value.parse()?);
+                        metadata.insert(HeaderName::from_str(&key)?, HeaderValue::from_str(value)?);
                     }
                 }
 
                 Ok::<(), Status>(())
             }));
 
-            let mut resp = hyper::Response::new(message);
-            *resp.headers_mut() = metadata.into_headers();
-            *resp.extensions_mut() = extensions;
-            resp.headers_mut().insert(
-                http::header::CONTENT_TYPE,
-                http::header::HeaderValue::from_static("application/grpc"),
-            );
+            // let mut resp = hyper::Response::new(message);
+            // *resp.headers_mut() = metadata.into_headers();
+            // *resp.extensions_mut() = extensions;
+            // resp.headers_mut().insert(
+            //     http::header::CONTENT_TYPE,
+            //     http::header::HeaderValue::from_static("application/grpc"),
+            // );
 
             Ok(resp)
         })
