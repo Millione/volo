@@ -118,7 +118,7 @@ impl<T> IntoRequest<T> for Request<T> {
 
 pub trait IntoStreamingRequest: sealed::Sealed {
     /// The RPC request stream type
-    type Stream: Stream<Item = Self::Message> + Send + Sync + 'static;
+    type Stream: Stream<Item = Self::Message> + Send + 'static;
 
     /// The RPC request type
     type Message;
@@ -129,7 +129,7 @@ pub trait IntoStreamingRequest: sealed::Sealed {
 
 impl<T> IntoStreamingRequest for T
 where
-    T: Stream + Send + Sync + 'static,
+    T: Stream + Send + 'static,
 {
     type Stream = T;
     type Message = T::Item;
@@ -141,7 +141,7 @@ where
 
 impl<T> IntoStreamingRequest for Request<T>
 where
-    T: Stream + Send + Sync + 'static,
+    T: Stream + Send + 'static,
 {
     type Stream = T;
     type Message = T::Item;
